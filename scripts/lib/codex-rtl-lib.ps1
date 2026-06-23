@@ -5,7 +5,7 @@
 #
 # No elevation required: everything writes under the user profile.
 
-$script:PatchVersion = '0.3.0'
+$script:PatchVersion = '1.0.0'
 $script:StateDir  = Join-Path $env:LOCALAPPDATA 'CodexRtlPatch'
 $script:BinDir    = Join-Path $script:StateDir 'bin'
 $script:StateFile = Join-Path $script:StateDir 'state.json'

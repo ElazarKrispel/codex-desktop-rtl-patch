@@ -3,7 +3,7 @@
 // Adds smart bidirectional (RTL) handling for Hebrew/Arabic text in the
 // OpenAI Codex desktop app, while keeping code strictly left-to-right.
 //
-// Strategy (v0.2.0):
+// Strategy (v1.0.0):
 //   * Prose blocks that contain Hebrew/Arabic get a REAL `dir="rtl"` attribute.
 //     A real dir gives correct ordering, correct `text-align:start` alignment,
 //     AND native bidi isolation from siblings.
@@ -20,7 +20,7 @@
 
   if (typeof document === "undefined") return;
   if (window.__codexRtlPatchVersion) return;
-  window.__codexRtlPatchVersion = "0.2.0";
+  window.__codexRtlPatchVersion = "1.0.0";
 
   // Attribute used to mark elements whose `dir` WE manage, so we never clobber
   // or remove a `dir` that the app itself set.
