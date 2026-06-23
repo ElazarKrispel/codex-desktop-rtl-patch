@@ -1,4 +1,4 @@
-# asar.ps1 — minimal, dependency-free reader for Electron ASAR archives.
+# asar.ps1 - minimal, dependency-free reader for Electron ASAR archives.
 # We only need to EXTRACT (Electron loads an unpacked app/ folder because the
 # OnlyLoadAppFromAsar fuse is off), so no packer / integrity hashing is required.
 
@@ -49,7 +49,7 @@ several .NET calls; extracts every packed file. Files flagged "unpacked" live in
                     $stack.Push([pscustomobject]@{ Node = $child; Dir = $path })
                 }
                 elseif ($props -contains 'link') {
-                    # in-archive symlink — not used by the Codex renderer; skip.
+                    # in-archive symlink - not used by the Codex renderer; skip.
                 }
                 else {
                     if (($props -contains 'unpacked') -and $child.unpacked) { continue }

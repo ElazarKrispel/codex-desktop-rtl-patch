@@ -1,4 +1,4 @@
-// asar-edit.mjs — surgical, dependency-free in-place editor for an Electron ASAR.
+// asar-edit.mjs - surgical, dependency-free in-place editor for an Electron ASAR.
 //
 // Codex's custom "owl-electron" runtime loads resources\app.asar only (it does
 // NOT fall back to an unpacked app\ folder), so we must keep app.asar and edit

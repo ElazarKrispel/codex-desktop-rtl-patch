@@ -2,7 +2,7 @@
 <html lang="he">
 <head>
 <meta charset="utf-8">
-<title>Codex RTL — bidi harness</title>
+<title>Codex RTL - bidi harness</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -24,13 +24,13 @@
   .lbl { font-size: 10.5px; color: #8a909b; margin-bottom: 3px; direction: ltr; text-align: left; }
   .body p, .body li { margin: 2px 0; }
 
-  /* assistant inline code pill — Codex class: inline rounded-sm border px-1 font-mono */
+  /* assistant inline code pill - Codex class: inline rounded-sm border px-1 font-mono */
   code.pill {
     border-radius: 3px; border: 1px solid #4b4d57;
     background: rgba(255,255,255,0.06); padding: 0 4px;
     font-family: ui-monospace, "Cascadia Code", monospace; font-size: 0.86em; color: #d7c9ff;
   }
-  /* user message paragraph — Codex class: text-base ... whitespace-pre-wrap */
+  /* user message paragraph - Codex class: text-base ... whitespace-pre-wrap */
   p.usermsg { white-space: pre-wrap; }
 
   /* ---- NEW patch CSS (verbatim subset from src/codex-rtl-patch.js) ---- */
@@ -40,7 +40,7 @@
 </style>
 </head>
 <body>
-  <h1>Codex Desktop RTL — bidi harness (3-way)</h1>
+  <h1>Codex Desktop RTL - bidi harness (3-way)</h1>
   <div class="legend">
     <b style="color:#ff9f97">NONE</b> = app default (no patch) ·
     <b style="color:#ffd591">OLD v0.1.0</b> = parent <code>unicode-bidi:plaintext</code> + forced dir ·
@@ -48,17 +48,17 @@
     Correct = Hebrew reads right-to-left; English/code sits inline at its logical spot.
   </div>
 
-  <h2>Surface A — assistant markdown (real &lt;code&gt; pills)</h2>
+  <h2>Surface A - assistant markdown (real &lt;code&gt; pills)</h2>
   <div class="cols" id="A"></div>
 
-  <h2>Surface B — user message (raw text, literal backticks, white-space:pre-wrap)</h2>
+  <h2>Surface B - user message (raw text, literal backticks, white-space:pre-wrap)</h2>
   <div class="cols" id="B"></div>
 
 <script>
   var surfaceA = [
     { n:1, label:"Hebrew + `english`",        html:'<p>זה נראה מוזר <code class="pill">english</code> אבל אם זה</p>' },
     { n:2, label:"Hebrew + `english` no-space", html:'<p>זה נראה מוזר<code class="pill">english</code>אבל אם זה</p>' },
-    { n:3, label:"path mid-sentence",        html:'<p>הסרתי re-export מיותר מ־<code class="pill">src/lib/google-calendar.ts</code> והכל תקין</p>' },
+    { n:3, label:"path mid-sentence",        html:'<p>הסרתי re-export מיותר מ־<code class="pill">src/lib/date-utils.ts</code> והכל תקין</p>' },
     { n:4, label:"line STARTS with code",    html:'<p><code class="pill">npm run build</code> עבר בהצלחה והכול ירוק</p>' },
     { n:5, label:"RTL list with code",       html:'<ul><li>הריצו <code class="pill">npm ci</code> להתקנה</li><li>בדקו <code class="pill">dist/index.js</code></li></ul>' }
   ];
@@ -66,7 +66,7 @@
     { n:1, label:"free english in Hebrew",   text:"שלום וברכה אני עכשיו כותב ב: english וזה נראה טוב ביחד עם עברית" },
     { n:2, label:"`english` literal backticks", text:"זה נראה מוזר `english` אבל אם זה" },
     { n:3, label:"`english` no spaces",      text:"זה נראה מוזר`english`אבל אם זה" },
-    { n:4, label:"path `code` in user msg",  text:"תבדוק את `src/lib/google-calendar.ts` בבקשה" }
+    { n:4, label:"path `code` in user msg",  text:"תבדוק את `src/lib/date-utils.ts` בבקשה" }
   ];
 
   function isRTLChar(c){ return (c>=0x0590&&c<=0x05ff)||(c>=0x0600&&c<=0x06ff); }
@@ -90,7 +90,7 @@
         c.setAttribute("dir","ltr"); c.style.direction="ltr"; c.style.textAlign="left"; c.style.unicodeBidi="isolate"; });
     }
   }
-  var MODES = [["none","NONE — no patch (baseline)"],["old","OLD v0.1.0 — plaintext"],["new","NEW v0.2.0 — real dir"]];
+  var MODES = [["none","NONE - no patch (baseline)"],["old","OLD v0.1.0 - plaintext"],["new","NEW v0.2.0 - real dir"]];
   function buildSurface(rootId, items, isUser){
     var root=document.getElementById(rootId);
     MODES.forEach(function(m){

@@ -1,4 +1,4 @@
-# Watch-CodexRtl.ps1 — background watcher (started at logon via HKCU\Run, and once
+# Watch-CodexRtl.ps1 - background watcher (started at logon via HKCU\Run, and once
 # at install time). Deployed to %LOCALAPPDATA%\CodexRtlPatch\bin. No admin.
 #
 # It updates the patched copy ONLY when the Codex version changed AND Codex (RTL)
