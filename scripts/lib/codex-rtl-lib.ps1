@@ -274,6 +274,23 @@ function Test-RtlPackage {
     return $true
 }
 
+function Assert-RtlDiskSpace {
+    # Worst-case preflight before building: we need room for a full staging copy
+    # (~source size) plus a safety buffer. The atomic swap renames within the same
+    # volume, so it needs no extra space. Logs the numbers; throws [DISK] if short.
+    param([Parameter(Mandatory)][string]$SourceDir)
+    $drive = Split-Path -Qualifier $script:Staging
+    $need = $null; $free = $null
+    try { $need = (Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } catch {}
+    try { $free = [double](Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction Stop).FreeSpace } catch {}
+    if (-not $need -or -not $free) { Write-RtlLog 'Disk check skipped (could not measure size/free space).'; return }
+    $required = ($need * 1.1) + 1GB
+    Write-RtlLog ("Disk check: drive={0} free={1:N1}GB source={2:N1}GB required={3:N1}GB" -f $drive, ($free / 1GB), ($need / 1GB), ($required / 1GB))
+    if ($free -lt $required) {
+        throw ("[DISK] Not enough free space on {0}: about {1:N1} GB needed, {2:N1} GB free. Free up space and try again." -f $drive, ($required / 1GB), ($free / 1GB))
+    }
+}
+
 function Invoke-Robocopy {
     param([string]$From, [string]$To)
     $a = @("`"$From`"", "`"$To`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
@@ -341,7 +358,14 @@ function New-RtlShortcut {
             $sc.IconLocation     = "$exe,0"   # original Codex icon
             $sc.Description       = 'Codex with Hebrew / RTL support'
             $sc.Save()
-        } catch { Write-RtlLog "shortcut '$lnk' failed: $($_.Exception.Message)" }
+        } catch {
+            $m = $_.Exception.Message
+            if ($lnk -eq $script:ShortcutDesktop -and ($m -match 'denied|access')) {
+                Write-RtlLog "Desktop shortcut blocked (likely Controlled Folder Access); the Start-menu shortcut still works. $m"
+            } else {
+                Write-RtlLog "shortcut '$lnk' failed: $m"
+            }
+        }
     }
     foreach ($old in $script:LegacyShortcuts) {
         if (Test-Path $old) { try { Remove-Item -LiteralPath $old -Force } catch {} }
@@ -398,6 +422,44 @@ function Invoke-CodexRtlDiagnose {
     return [pscustomobject]$r
 }
 
+# Read-only status for the GUI to frame the right action. States:
+#   Fresh             no install, ready to install
+#   Update            Codex itself updated; the RTL copy is behind
+#   PatchUpgrade      our tool version changed; re-apply the patch
+#   UpToDate          installed and current
+#   Repair            a copy exists but its state record is missing/invalid
+#   ReinstallRequired state written by a newer tool version
+function Get-CodexRtlStatus {
+    $src = $null; try { $src = Resolve-CodexSource } catch {}
+    $copyOk = Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe')
+    $state = Read-RtlState
+    # corrupt state file (exists but did not parse) -> back it up once.
+    if (-not $state -and (Test-Path $script:StateFile)) {
+        try {
+            $raw = Get-Content $script:StateFile -Raw -ErrorAction Stop
+            if ($raw -and $raw.Trim()) {
+                Move-Item -LiteralPath $script:StateFile -Destination "$($script:StateFile).bad" -Force
+                Write-RtlLog 'Corrupt state.json backed up to state.json.bad.'
+            }
+        } catch {}
+    }
+    $o = [ordered]@{
+        State            = 'Fresh'
+        CodexFound       = [bool]$src
+        AvailableVersion = $(if ($src) { $src.Version } else { $null })
+        InstalledVersion = $(if ($state) { $state.codexVersion } else { $null })
+        CopyExists       = $copyOk
+        Running          = (Test-CodexRtlRunning)
+    }
+    if ($state -and $state.schemaVersion -and ([int]$state.schemaVersion -gt $script:SchemaVersion)) { $o.State = 'ReinstallRequired' }
+    elseif (-not $state) { $o.State = $(if ($copyOk) { 'Repair' } else { 'Fresh' }) }
+    elseif (-not $copyOk) { $o.State = 'Repair' }
+    elseif ($src -and $state.sourceSignature -ne $src.Signature) { $o.State = 'Update' }
+    elseif ($state.patchVersion -ne $script:PatchVersion) { $o.State = 'PatchUpgrade' }
+    else { $o.State = 'UpToDate' }
+    return [pscustomobject]$o
+}
+
 # ----------------------------------------------------------------- core update
 
 function Invoke-CodexRtlUpdate {
@@ -405,6 +467,12 @@ function Invoke-CodexRtlUpdate {
     if (-not (Enter-RtlLock)) { Write-RtlLog 'Another update is in progress; skipping.'; return }
     try {
         Set-RtlStep 'preflight' 5
+        # self-heal: recover from a crash mid-swap (CopyRoot gone, OldRoot present).
+        if (-not (Test-Path $script:CopyRoot) -and (Test-Path $script:OldRoot)) {
+            Write-RtlLog 'Self-heal: CopyRoot missing but OldRoot present; restoring previous copy.'
+            try { Rename-Item -LiteralPath $script:OldRoot -NewName (Split-Path $script:CopyRoot -Leaf) -Force }
+            catch { Write-RtlLog "self-heal failed: $($_.Exception.Message)" }
+        }
         $src = Resolve-CodexSource
         if (-not $src) {
             Write-RtlLog '[NOCODEX] No Codex install found.'
@@ -430,13 +498,14 @@ function Invoke-CodexRtlUpdate {
         $stagingReady = (Test-Path (Join-Path $script:Staging 'app\Codex.exe')) -and
                         (Test-Path $stagingSig) -and ((Get-Content $stagingSig -Raw).Trim() -eq $src.Signature)
         if (-not $stagingReady) {
+            Assert-RtlDiskSpace -SourceDir $src.AppDir
             Set-RtlStep 'copy' 15 $true
             Write-RtlLog 'Building patched copy in staging...'
             if (Test-Path $script:Staging) { Remove-Item -LiteralPath $script:Staging -Recurse -Force }
             $stagingApp = Join-Path $script:Staging 'app'
             New-Item -ItemType Directory -Force -Path $stagingApp | Out-Null
             $rc = Invoke-Robocopy -From $src.AppDir -To $stagingApp
-            if ($rc -ge 8) { throw "robocopy failed (exit $rc); copy incomplete (out of disk space or locked files)." }
+            if ($rc -ge 8) { throw "[LOCK] Could not copy all files (robocopy exit $rc); they may be locked by antivirus or another process. Close them and try again." }
             Set-RtlStep 'inject' 70 $true
             Invoke-AsarInject -AsarPath (Join-Path $stagingApp 'resources\app.asar') -PatchJs $patchJs -AllowExternalNodeFallback:$AllowExternalNodeFallback
             Set-Content -LiteralPath $stagingSig -Value $src.Signature -Encoding UTF8 -NoNewline
@@ -461,7 +530,10 @@ function Invoke-CodexRtlUpdate {
         Write-RtlLog "DONE: Codex (RTL) now at v$($src.Version)."
         Set-RtlStep 'done' 100
         if ($Auto) { Show-RtlToast 'Codex RTL updated' "Patched for Codex v$($src.Version)." }
-    } finally {
+    }
+    catch [System.UnauthorizedAccessException] { throw "[AV] Access was denied, possibly blocked by antivirus or Controlled Folder Access. $($_.Exception.Message)" }
+    catch [System.Security.SecurityException]   { throw "[AV] A security restriction blocked the operation, possibly antivirus. $($_.Exception.Message)" }
+    finally {
         Exit-RtlLock
     }
 }
@@ -525,4 +597,29 @@ function Copy-RtlBin {
     Copy-Item (Join-Path $RepoRoot 'scripts\Watch-CodexRtl.ps1')    (Join-Path $script:BinDir 'Watch-CodexRtl.ps1') -Force
     Write-RtlLog "Deployed watcher runtime to $($script:BinDir)"
     return (Join-Path $script:BinDir 'Watch-CodexRtl.ps1')
+}
+
+# ----------------------------------------------------------------- uninstall
+
+function Invoke-CodexRtlUninstall {
+    # Remove the watcher, the patched copy (+ staging/old), all shortcuts and state.
+    # The logs folder is KEPT by default (for diagnostics); pass -PurgeLogs to delete it.
+    param([switch]$PurgeLogs)
+    if (Test-CodexRtlRunning) { throw '[LOCK] Codex (RTL) is running. Close it and try again.' }
+    if (-not (Enter-RtlLock)) { throw '[LOCK] An update is in progress; try again in a moment.' }
+    try {
+        Unregister-CodexRtlWatcher   # stops the watcher + removes the Run key + legacy task
+        foreach ($d in @($script:CopyRoot, $script:Staging, $script:OldRoot, $script:BinDir)) {
+            if (Test-Path $d) {
+                try { Remove-Item -LiteralPath $d -Recurse -Force; Write-RtlLog "removed $d" }
+                catch { Write-RtlLog "could not remove $d : $($_.Exception.Message)" }
+            }
+        }
+        foreach ($lnk in $script:ShortcutPaths) {
+            if (Test-Path $lnk) { try { Remove-Item -LiteralPath $lnk -Force; Write-RtlLog "removed $lnk" } catch {} }
+        }
+        if (Test-Path $script:StateFile) { Remove-Item -LiteralPath $script:StateFile -Force }
+        if ($PurgeLogs -and (Test-Path $script:LogsDir)) { try { Remove-Item -LiteralPath $script:LogsDir -Recurse -Force; Write-RtlLog 'Purged logs.' } catch {} }
+        Write-RtlLog 'Uninstall complete.'
+    } finally { Exit-RtlLock }
 }

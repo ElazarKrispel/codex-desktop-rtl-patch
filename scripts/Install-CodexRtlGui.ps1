@@ -80,6 +80,7 @@ $script:Sync = [hashtable]::Synchronized(@{
         Ok          = $false
         Err         = $null
         Busy        = $false
+        Op          = 'install'
     })
 $script:Job = $null
 
@@ -97,15 +98,19 @@ function Get-StepHebrew([string]$key) {
     }
 }
 
-function Get-ErrHebrew([string]$msg) {
-    if (-not $msg) { return 'ההתקנה נכשלה. ראה/י את הלוג למטה ושלח/י אותו למפתח.' }
+function Get-RtlHebrewError([string]$msg) {
+    if (-not $msg) { return 'הפעולה נכשלה. ראה/י את הלוג למטה ושלח/י אותו למפתח.' }
     switch -Regex ($msg) {
         '^\[NOCODEX\]' { 'Codex אינו מותקן. התקן/י אותו מחנות Microsoft, ואז לחץ/י "בדוק שוב".' ; break }
         '^\[NODE\]'    { 'ה-Node המובנה של Codex לא נמצא. ייתכן ש-Codex לא הותקן במלואו או עודכן. נסה/י לתקן את Codex דרך החנות, ואז לנסות שוב.' ; break }
         '^\[LAYOUT\]'  { 'Codex זוהה אך המבנה הפנימי שלו אינו כמצופה. ייתכן ש-Codex עודכן ושהכלי צריך עדכון. עדכן/י את הכלי או פנה/י למפתח.' ; break }
+        '^\[DISK\]'    { 'אין מספיק מקום פנוי בדיסק. פנה/י מספר GB ונסה/י שוב.' ; break }
+        '^\[LOCK\]'    { 'חלק מהקבצים נעולים (אולי אנטי-וירוס, סייר הקבצים, או ש-Codex (RTL) פתוח). סגור/י אותם ונסה/י שוב.' ; break }
+        '^\[AV\]'      { 'הפעולה נחסמה כנראה על ידי האנטי-וירוס (Windows Defender). הכלי עורך רק עותק מקומי של Codex ואינו נוגע במקור. אפשר לאשר זמנית או להוסיף חריגה ולנסות שוב.' ; break }
         '^\[PACKAGE\]' { 'חבילת ההתקנה חסרה קבצים. ודא/י שחילצת את כל ה-ZIP, לא רק את קובץ ה-cmd, ונסה/י שוב.' ; break }
         '^\[SAFETY\]'  { 'הפעולה בוטלה מטעמי בטיחות (ניסיון לגעת בקובץ מחוץ לעותק ה-RTL). ההתקנה המקורית של Codex לא נפגעה.' ; break }
-        default        { "ההתקנה נכשלה. הפרטים נשמרו בקובץ הלוג, אנא שלח/י אותו למפתח.`r`n`r`n$msg" }
+        '^\[CANCEL\]'  { 'הפעולה בוטלה.' ; break }
+        default        { "הפעולה נכשלה. הפרטים נשמרו בקובץ הלוג, אנא שלח/י אותו למפתח.`r`n`r`n$msg" }
     }
 }
 
@@ -213,48 +218,59 @@ function New-RtlButton([string]$text, [int]$minWidth = 110) {
 $btnPrimary = New-RtlButton 'התקן' 150
 $btnPrimary.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
 $btnSecondary = New-RtlButton 'התקן מחדש'
+$btnUninstall = New-RtlButton 'הסר התקנה'
 $btnDiag = New-RtlButton 'אבחון'
 $btnCopyLog = New-RtlButton 'העתק לוג'
 $btnOpenLogs = New-RtlButton 'פתח תיקיית לוגים'
 $btnClose = New-RtlButton 'סגור'
-$buttons.Controls.AddRange(@($btnPrimary, $btnSecondary, $btnDiag, $btnCopyLog, $btnOpenLogs, $btnClose))
+$buttons.Controls.AddRange(@($btnPrimary, $btnSecondary, $btnUninstall, $btnDiag, $btnCopyLog, $btnOpenLogs, $btnClose))
 
-# --- State / preflight -------------------------------------------------------
-# Phase 1 basic states: NoCodex / NotInstalled / Installed.
-function Get-BasicState {
-    $src = $null
-    try { $src = Resolve-CodexSource } catch {}
-    if (-not $src) { return 'NoCodex' }
-    $state = Read-RtlState
-    $copyOk = Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe')
-    if ($state -and $copyOk) { return 'Installed' }
-    return 'NotInstalled'
-}
-
+# --- State / preflight: frame the UI per Get-CodexRtlStatus ------------------
 function Update-Buttons {
     if ($script:Sync.Busy) {
-        foreach ($b in @($btnPrimary, $btnSecondary, $btnDiag, $btnCopyLog, $btnOpenLogs, $btnClose)) { $b.Enabled = $false }
+        foreach ($b in @($btnPrimary, $btnSecondary, $btnUninstall, $btnDiag, $btnCopyLog, $btnOpenLogs, $btnClose)) { $b.Enabled = $false }
         return
     }
-    $st = Get-BasicState
-    $btnDiag.Enabled = $true; $btnCopyLog.Enabled = $true; $btnOpenLogs.Enabled = $true; $btnClose.Enabled = $true
-    switch ($st) {
-        'NoCodex' {
-            $status.Text = 'Codex אינו מותקן. התקן/י אותו מחנות Microsoft, ואז לחץ/י "בדוק שוב".'
-            $btnPrimary.Text = 'בדוק שוב'; $btnPrimary.Enabled = $true; $btnPrimary.Tag = 'recheck'
-            $btnSecondary.Visible = $false
+    foreach ($b in @($btnDiag, $btnCopyLog, $btnOpenLogs, $btnClose)) { $b.Enabled = $true }
+    $btnPrimary.Enabled = $true; $btnSecondary.Visible = $false; $btnUninstall.Visible = $false
+    $st = $null; try { $st = Get-CodexRtlStatus } catch {}
+    if (-not $st -or -not $st.CodexFound) {
+        $status.Text = 'Codex אינו מותקן. התקן/י אותו מחנות Microsoft, ואז לחץ/י "בדוק שוב".'
+        $btnPrimary.Text = 'בדוק שוב'; $btnPrimary.Tag = 'recheck'
+        if ($st -and $st.CopyExists) { $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true }
+        return
+    }
+    switch ($st.State) {
+        'Update' {
+            $status.Text = "Codex עודכן לגרסה $($st.AvailableVersion). נעדכן את גרסת ה-RTL."
+            $btnPrimary.Text = 'עדכן'; $btnPrimary.Tag = 'install'
+            $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true
         }
-        'NotInstalled' {
+        'PatchUpgrade' {
+            $status.Text = 'יש גרסה חדשה של הכלי. נעדכן את ההתקנה.'
+            $btnPrimary.Text = 'עדכן'; $btnPrimary.Tag = 'install'
+            $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true
+        }
+        'Repair' {
+            $status.Text = 'נמצא עותק קיים ללא רישום תקין. אפשר לתקן את ההתקנה.'
+            $btnPrimary.Text = 'תקן'; $btnPrimary.Tag = 'install'
+            $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true
+        }
+        'ReinstallRequired' {
+            $status.Text = 'נכתב מידע מגרסה חדשה יותר של הכלי. צריך התקנה מחדש.'
+            $btnPrimary.Text = 'התקן מחדש'; $btnPrimary.Tag = 'install'
+            $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true
+        }
+        'Fresh' {
             $status.Text = 'מוכן להתקנה.'
-            $btnPrimary.Text = 'התקן'; $btnPrimary.Enabled = $true; $btnPrimary.Tag = 'install'
-            $btnSecondary.Visible = $false
+            $btnPrimary.Text = 'התקן'; $btnPrimary.Tag = 'install'
         }
-        'Installed' {
-            $st2 = Read-RtlState
-            $ver = if ($st2.codexVersion) { $st2.codexVersion } elseif ($st2.version) { $st2.version } else { '?' }
-            $status.Text = "מותקן ומוכן (Codex v$ver). אפשר לפתוח את Codex (RTL)."
-            $btnPrimary.Text = 'פתח את Codex (RTL)'; $btnPrimary.Enabled = $true; $btnPrimary.Tag = 'open'
+        default {
+            # UpToDate
+            $status.Text = "מותקן ומוכן (Codex v$($st.InstalledVersion)). אפשר לפתוח את Codex (RTL)."
+            $btnPrimary.Text = 'פתח את Codex (RTL)'; $btnPrimary.Tag = 'open'
             $btnSecondary.Visible = $true; $btnSecondary.Enabled = $true
+            $btnUninstall.Visible = $true; $btnUninstall.Enabled = $true
         }
     }
 }
@@ -267,7 +283,7 @@ function Start-Install {
     }
     $script:Sync.Done = $false; $script:Sync.Ok = $false; $script:Sync.Err = $null
     $script:Sync.StepKey = ''; $script:Sync.StepPct = 0; $script:Sync.StepMarquee = $false
-    $script:Sync.Busy = $true
+    $script:Sync.Op = 'install'; $script:Sync.Busy = $true
     $script:LogBox.Clear()
     $script:ProgressBar.Visible = $true; $script:ProgressBar.Style = 'Continuous'; $script:ProgressBar.Value = 0
     Update-Buttons
@@ -290,6 +306,46 @@ function Start-Install {
                 $watch = Copy-RtlBin -RepoRoot $repoRoot
                 Register-CodexRtlWatcher -WatchScript $watch
                 Start-CodexRtlWatcher -WatchScript $watch
+                $sync.Ok = $true
+            }
+            catch { $sync.Err = $_.Exception.Message }
+            finally { $sync.Done = $true }
+        })
+    $async = $ps.BeginInvoke()
+    $script:Job = @{ ps = $ps; rs = $rs; async = $async }
+    $script:Timer.Start()
+}
+
+# --- Background uninstall ----------------------------------------------------
+function Start-Uninstall {
+    if (Test-CodexRtlRunning) {
+        [System.Windows.Forms.MessageBox]::Show('Codex (RTL) פתוח כרגע. סגור/י אותו ואז נסה/י שוב.', 'Codex RTL', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        'להסיר את Codex (RTL)? יוסרו העותק, הקיצורים והעדכון האוטומטי. ה-Codex המקורי לא ייפגע, וקובצי הלוג יישמרו.',
+        'Codex RTL', 'YesNo', 'Question')
+    if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $script:Sync.Done = $false; $script:Sync.Ok = $false; $script:Sync.Err = $null
+    $script:Sync.StepKey = ''; $script:Sync.StepPct = 0; $script:Sync.StepMarquee = $false
+    $script:Sync.Op = 'uninstall'; $script:Sync.Busy = $true
+    $script:LogBox.Clear()
+    $script:StatusLabel.Text = 'מסיר את ההתקנה...'
+    $script:ProgressBar.Visible = $true; $script:ProgressBar.Style = 'Marquee'; $script:ProgressBar.MarqueeAnimationSpeed = 30
+    Update-Buttons
+
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
+    $rs.SessionStateProxy.SetVariable('sync', $script:Sync)
+    $rs.SessionStateProxy.SetVariable('libPath', $script:LibPath)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript({
+            . $libPath
+            $script:UiSink = { param($msg) [void]$sync.Lines.Add($msg) }
+            try {
+                Start-RtlInstallLog 'uninstall' | Out-Null
+                Write-RtlUi 'מסיר את ההתקנה...'
+                Invoke-CodexRtlUninstall
                 $sync.Ok = $true
             }
             catch { $sync.Err = $_.Exception.Message }
@@ -334,15 +390,23 @@ $timer.Add_Tick({
                 $script:Job = $null
             }
             $script:Sync.Busy = $false
+            $isUninstall = ($script:Sync.Op -eq 'uninstall')
             if ($script:Sync.Ok) {
-                $script:ProgressBar.Style = 'Continuous'; $script:ProgressBar.Value = 100
-                $script:StatusLabel.Text = 'ההתקנה הושלמה! אפשר לפתוח את Codex (RTL).'
-                Add-LogLine 'ההתקנה הושלמה בהצלחה.'
+                if ($isUninstall) {
+                    $script:ProgressBar.Visible = $false
+                    $script:StatusLabel.Text = 'ההסרה הושלמה.'
+                    Add-LogLine 'ההסרה הושלמה בהצלחה.'
+                }
+                else {
+                    $script:ProgressBar.Style = 'Continuous'; $script:ProgressBar.Value = 100
+                    $script:StatusLabel.Text = 'ההתקנה הושלמה! אפשר לפתוח את Codex (RTL).'
+                    Add-LogLine 'ההתקנה הושלמה בהצלחה.'
+                }
             }
             else {
                 $script:ProgressBar.Visible = $false
-                $heb = Get-ErrHebrew ([string]$script:Sync.Err)
-                $script:StatusLabel.Text = 'ההתקנה נכשלה.'
+                $heb = Get-RtlHebrewError ([string]$script:Sync.Err)
+                $script:StatusLabel.Text = if ($isUninstall) { 'ההסרה נכשלה.' } else { 'ההתקנה נכשלה.' }
                 Add-LogLine $heb
                 [System.Windows.Forms.MessageBox]::Show($heb, 'Codex RTL', 'OK', 'Error') | Out-Null
             }
@@ -364,6 +428,7 @@ $btnPrimary.Add_Click({
         }
     })
 $btnSecondary.Add_Click({ Start-Install })   # reinstall
+$btnUninstall.Add_Click({ Start-Uninstall })
 
 $btnDiag.Add_Click({
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -415,7 +480,7 @@ $form.Add_Shown({ Update-Buttons })
 if ($SelfTest) {
     # Construct + run preflight once, but do not block on ShowDialog.
     Update-Buttons
-    Write-Host "SelfTest OK: form built; basic state = $(Get-BasicState); label = [$($status.Text)]"
+    Write-Host "SelfTest OK: form built; state = $((Get-CodexRtlStatus).State); label = [$($status.Text)]"
     $form.Dispose()
     return
 }
