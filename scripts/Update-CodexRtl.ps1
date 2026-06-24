@@ -8,10 +8,11 @@
     Rebuild even if the Codex version has not changed.
 #>
 [CmdletBinding()]
-param([switch]$Force)
+param([switch]$Force, [switch]$AllowExternalNodeFallback)
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'lib\codex-rtl-lib.ps1')
-Invoke-CodexRtlUpdate -Force:$Force
+Start-RtlInstallLog 'update' | Out-Null
+Invoke-CodexRtlUpdate -Force:$Force -AllowExternalNodeFallback:$AllowExternalNodeFallback
 $state = Read-RtlState
-if ($state) { Write-Host "[OK] Codex (RTL) at v$($state.version) (mode=$($state.mode))." -ForegroundColor Green }
+if ($state) { Write-Host "[OK] Codex (RTL) at v$($state.codexVersion) (mode=$($state.mode))." -ForegroundColor Green }

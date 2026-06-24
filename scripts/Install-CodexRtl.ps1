@@ -1,31 +1,36 @@
 <#
 .SYNOPSIS
-    Install the Codex RTL patch (patched copy + auto-update watcher).
+    Install the Codex RTL patch (patched copy + auto-update watcher), headless.
 .DESCRIPTION
-    Builds a patched copy of the Microsoft Store Codex (or patches a direct
-    install in place), creates a 'Codex (RTL)' shortcut, and registers a
-    per-user scheduled task that re-applies the patch whenever Codex updates -
-    safely, while Codex is closed, with no administrator rights.
+    Builds a patched COPY of Codex (the original install is only read, never
+    modified), creates "Codex <ivrit>" Start-menu and Desktop shortcuts, and
+    registers a per-user logon watcher that re-applies the patch whenever Codex
+    updates - safely, while Codex is closed, with no administrator rights. Codex's
+    bundled Node is used, so no external Node.js is required. The GUI installer
+    wraps this same logic.
 .PARAMETER NoWatcher
-    Skip registering the auto-update task (manual updates only).
+    Skip registering the auto-update watcher (manual updates only).
+.PARAMETER AllowExternalNodeFallback
+    Dev/headless only: if Codex's bundled Node is missing, fall back to Node on PATH.
+    Not used by the end-user GUI (which requires the bundled Node).
 #>
 [CmdletBinding()]
-param([switch]$NoWatcher)
+param([switch]$NoWatcher, [switch]$AllowExternalNodeFallback)
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 . (Join-Path $scriptDir 'lib\codex-rtl-lib.ps1')
 
+Start-RtlInstallLog 'install' | Out-Null
+Test-RtlPackage -RepoRoot $repoRoot | Out-Null
+
 if (Test-CodexRtlRunning) {
     throw "Codex (RTL) is currently running. Close it, then re-run the installer."
 }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    throw "Node.js is required but was not found on PATH. Install it from https://nodejs.org (LTS), reopen PowerShell, and re-run."
-}
 
 Write-Host "[*] Building the patched Codex copy (first run copies ~1.6 GB)..." -ForegroundColor Cyan
-Invoke-CodexRtlUpdate -Force
+Invoke-CodexRtlUpdate -Force -AllowExternalNodeFallback:$AllowExternalNodeFallback
 
 $state = Read-RtlState
 if (-not $state) { throw "Install did not complete. See $($script:LogFile)." }
@@ -38,10 +43,8 @@ if (-not $NoWatcher) {
 }
 
 Write-Host ""
-Write-Host "[OK] Codex RTL patch installed (mode=$($state.mode), Codex v$($state.version))." -ForegroundColor Green
-if ($state.mode -eq 'copy') {
-    Write-Host "     Launch Codex from the 'Codex (RTL)' Start-menu shortcut." -ForegroundColor Green
-}
+Write-Host "[OK] Codex RTL patch installed (Codex v$($state.codexVersion))." -ForegroundColor Green
+Write-Host "     Launch Codex from the '$($script:ShortcutLabel)' shortcut (Start menu or Desktop)." -ForegroundColor Green
 if (-not $NoWatcher) {
     Write-Host "     Auto-update is ON (no admin) - re-patches when Codex updates, while Codex is closed." -ForegroundColor Green
 }

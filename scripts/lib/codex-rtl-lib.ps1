@@ -1,24 +1,61 @@
 # codex-rtl-lib.ps1
 # Shared logic for the Codex RTL patch: resolve the Codex install, build a patched
-# copy via staging + atomic swap (Store/MSIX), or patch in place (direct install),
-# manage the auto-update watcher, toast, logging and a single-instance lock.
+# copy via staging + atomic swap, manage the auto-update watcher, logging, progress
+# reporting and a single-instance lock.
+#
+# SAFETY INVARIANT: we NEVER modify the original Codex install. We only READ from it
+# and build/maintain a SEPARATE copy under %LOCALAPPDATA%\OpenAI\CodexRtl. Every asar
+# edit happens inside staging / the RTL copy only (enforced in Invoke-AsarInject).
 #
 # No elevation required: everything writes under the user profile.
+# This file is ASCII-only; the Hebrew shortcut label is built from code points so it
+# is safe regardless of how Windows PowerShell 5.1 decodes the file.
 
-$script:PatchVersion = '1.0.0'
-$script:StateDir  = Join-Path $env:LOCALAPPDATA 'CodexRtlPatch'
-$script:BinDir    = Join-Path $script:StateDir 'bin'
-$script:StateFile = Join-Path $script:StateDir 'state.json'
-$script:LogFile   = Join-Path $script:StateDir 'rtl.log'
-$script:LockFile  = Join-Path $script:StateDir 'update.lock'
-$script:TaskName  = 'CodexRtlPatchWatcher'
-$script:CopyRoot  = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl'
-$script:Staging   = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl.staging'
-$script:OldRoot   = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl.old'
-$script:ShortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex (RTL).lnk'
+$script:PatchVersion  = '1.1.0'
+$script:SchemaVersion = 1
+$script:StateDir   = Join-Path $env:LOCALAPPDATA 'CodexRtlPatch'
+$script:BinDir     = Join-Path $script:StateDir 'bin'
+$script:LogsDir    = Join-Path $script:StateDir 'logs'
+$script:StateFile  = Join-Path $script:StateDir 'state.json'
+$script:LogFile    = Join-Path $script:StateDir 'rtl.log'
+$script:LockFile   = Join-Path $script:StateDir 'update.lock'
+$script:TaskName   = 'CodexRtlPatchWatcher'
+$script:CopyRoot   = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl'
+$script:Staging    = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl.staging'
+$script:OldRoot    = Join-Path $env:LOCALAPPDATA 'OpenAI\CodexRtl.old'
 $script:LockStream = $null
+$script:InstallLogFile = $null
+$script:StepSink   = $null   # { param($key,$percent,$marquee) }  optionally set by the GUI
+$script:UiSink     = $null   # { param($message) }                optionally set by the GUI
+
+# Shortcut: differentiate from the regular Codex by NAME only ("Codex (RTL)"),
+# keeping the ORIGINAL Codex icon. The app is not "in Hebrew", it only adds RTL
+# support, so the name says (RTL) rather than implying a Hebrew build.
+$script:ShortcutLabel   = 'Codex (RTL)'
+$script:ShortcutStart   = Join-Path ([Environment]::GetFolderPath('Programs')) ($script:ShortcutLabel + '.lnk')
+$script:ShortcutDesktop = Join-Path ([Environment]::GetFolderPath('Desktop'))  ($script:ShortcutLabel + '.lnk')
+$script:ShortcutPath    = $script:ShortcutStart   # back-compat alias
+# Legacy shortcut names from earlier builds (the short-lived "Codex <ivrit>" name),
+# removed so users never see duplicates. Built from code points (keeps this file ASCII).
+$script:_ivrit = 'Codex ' + (-join @([char]0x05E2, [char]0x05D1, [char]0x05E8, [char]0x05D9, [char]0x05EA))
+$script:LegacyShortcuts = @(
+    (Join-Path ([Environment]::GetFolderPath('Programs')) ($script:_ivrit + '.lnk')),
+    (Join-Path ([Environment]::GetFolderPath('Desktop'))  ($script:_ivrit + '.lnk'))
+)
+$script:ShortcutPaths = @($script:ShortcutStart, $script:ShortcutDesktop) + $script:LegacyShortcuts
 
 # ----------------------------------------------------------------- logging / ui
+
+function Start-RtlInstallLog {
+    # Begin a fresh timestamped run log under the stable logs folder. The detailed
+    # technical log goes to this file (and the rolling rtl.log); the GUI shows only
+    # friendly lines via Write-RtlUi / Set-RtlStep.
+    param([string]$Kind = 'install')
+    if (-not (Test-Path $script:LogsDir)) { New-Item -ItemType Directory -Force -Path $script:LogsDir | Out-Null }
+    $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $script:InstallLogFile = Join-Path $script:LogsDir ("{0}-{1}.log" -f $Kind, $ts)
+    return $script:InstallLogFile
+}
 
 function Write-RtlLog {
     param([string]$Message)
@@ -28,7 +65,23 @@ function Write-RtlLog {
         if (-not (Test-Path $script:StateDir)) { New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null }
         if ((Test-Path $script:LogFile) -and (Get-Item $script:LogFile).Length -gt 1MB) { Move-Item $script:LogFile "$($script:LogFile).old" -Force }
         Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
+        if ($script:InstallLogFile) { Add-Content -LiteralPath $script:InstallLogFile -Value $line -Encoding UTF8 }
     } catch {}
+}
+
+# Structured progress for the GUI: a step key, a percent, and a marquee flag (for
+# stages with no granular percentage). Also written to the file log.
+function Set-RtlStep {
+    param([string]$Key, [int]$Percent = -1, [bool]$Marquee = $false)
+    Write-RtlLog ("STEP {0} {1}%{2}" -f $Key, $Percent, $(if ($Marquee) { ' (marquee)' } else { '' }))
+    if ($script:StepSink) { try { & $script:StepSink $Key $Percent $Marquee } catch {} }
+}
+
+# A user-friendly status line for the GUI (kept separate from the detailed file log).
+function Write-RtlUi {
+    param([string]$Message)
+    Write-RtlLog "UI: $Message"
+    if ($script:UiSink) { try { & $script:UiSink $Message } catch {} }
 }
 
 function Show-RtlToast {
@@ -45,6 +98,22 @@ function Show-RtlToast {
     } catch { Write-RtlLog "toast failed: $($_.Exception.Message)" }
 }
 
+function Hide-RtlConsole {
+    # Reliably hide the console window of the current process, so a GUI or a
+    # background script shows no black PowerShell window (more robust than relying
+    # on -WindowStyle Hidden alone). Safe no-op when there is no console.
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'CodexRtl.ConsoleWin').Type) {
+            Add-Type -Namespace CodexRtl -Name ConsoleWin -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@
+        }
+        $h = [CodexRtl.ConsoleWin]::GetConsoleWindow()
+        if ($h -ne [System.IntPtr]::Zero) { [void][CodexRtl.ConsoleWin]::ShowWindow($h, 0) }  # SW_HIDE = 0
+    } catch {}
+}
+
 # ----------------------------------------------------------------- state
 
 function Read-RtlState {
@@ -53,9 +122,25 @@ function Read-RtlState {
 }
 
 function Write-RtlState {
+    # State schema v1. installedAt is preserved across updates; lastUpdatedAt is bumped.
     param([hashtable]$State)
     if (-not (Test-Path $script:StateDir)) { New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null }
-    [System.IO.File]::WriteAllText($script:StateFile, (([pscustomobject]$State) | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+    $existing = Read-RtlState
+    $now = (Get-Date).ToString('o')
+    $installedAt = if ($existing -and $existing.installedAt) { $existing.installedAt } else { $now }
+    $full = [ordered]@{
+        schemaVersion   = $script:SchemaVersion
+        patchVersion    = $script:PatchVersion
+        mode            = 'copy'
+        sourceSignature = $State.sourceSignature
+        sourcePath      = $State.sourcePath
+        copyRoot        = $script:CopyRoot
+        codexVersion    = $State.codexVersion
+        installedAt     = $installedAt
+        lastUpdatedAt   = $now
+    }
+    [System.IO.File]::WriteAllText($script:StateFile, (([pscustomobject]$full) | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+    Write-RtlLog "State written: $($script:StateFile) (sig=$($State.sourceSignature))"
 }
 
 # ----------------------------------------------------------------- lock
@@ -89,6 +174,17 @@ function Get-AsarEditPath {
     return $null
 }
 
+# The Node runtime that ships INSIDE Codex, next to the asar:
+#   <app>\resources\cua_node\bin\node.exe
+# Using it removes any external Node.js prerequisite for end users.
+function Resolve-RtlNode {
+    param([string]$AsarPath)
+    $resources = Split-Path -Parent $AsarPath
+    $node = Join-Path $resources 'cua_node\bin\node.exe'
+    if (Test-Path $node) { return $node }
+    return $null
+}
+
 function Resolve-CodexSource {
     # Prefer the Microsoft Store (MSIX) package.
     $pkg = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -101,7 +197,8 @@ function Resolve-CodexSource {
             }
         }
     }
-    # Fall back to a direct (non-Store) install.
+    # Fall back to a direct (non-Store) install. NOTE: even for a writable direct
+    # install we build a SEPARATE copy and never edit the original (safety invariant).
     $roots = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\codex'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Codex'),
@@ -123,6 +220,24 @@ function Resolve-CodexSource {
     return $null
 }
 
+# Validate that a resolved source has the layout we expect. Throws coded errors so
+# the installer fails safely instead of proceeding on wrong assumptions.
+function Test-CodexSource {
+    param([Parameter(Mandatory)]$Source)
+    if (-not $Source)                      { throw '[NOCODEX] No Codex source found.' }
+    if (-not (Test-Path $Source.AppDir))   { throw "[LAYOUT] Codex app folder missing: $($Source.AppDir)" }
+    if (-not (Test-Path $Source.AsarPath)) { throw "[LAYOUT] Codex app.asar missing: $($Source.AsarPath)" }
+    try {
+        $fs = [System.IO.File]::OpenRead($Source.AsarPath)
+        try { $hdr = New-Object byte[] 4; [void]$fs.Read($hdr, 0, 4) } finally { $fs.Dispose() }
+        if ([System.BitConverter]::ToUInt32($hdr, 0) -ne 4) { throw 'unexpected asar header' }
+    } catch { throw "[LAYOUT] Codex app.asar is not a readable asar: $($_.Exception.Message)" }
+    if (-not (Resolve-RtlNode -AsarPath $Source.AsarPath)) {
+        throw "[NODE] Codex bundled Node (resources\cua_node\bin\node.exe) was not found; Codex may be incompletely installed or its layout changed."
+    }
+    return $true
+}
+
 function Test-CodexRtlRunning {
     # Is the patched copy (CodexRtl) currently running? Match the exact folder so
     # CodexRtl.staging / CodexRtl.old never count as the live copy.
@@ -133,6 +248,49 @@ function Test-CodexRtlRunning {
     return [bool]$procs
 }
 
+# Is the ORIGINAL (non-RTL) Codex running? Detected by exe path NOT under our copy,
+# so the original Codex being open is never mistaken for the RTL copy.
+function Test-OriginalCodexRunning {
+    $prefix = $script:CopyRoot.TrimEnd('\') + '\'
+    $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and ($_.Name -ieq 'Codex') -and -not $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+    return [bool]$procs
+}
+
+# Verify the installer package is complete (catches "user extracted only the .cmd",
+# or a partial ZIP). Throws [PACKAGE] listing what is missing.
+function Test-RtlPackage {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $required = @(
+        'scripts\lib\codex-rtl-lib.ps1',
+        'scripts\lib\asar-edit.mjs',
+        'src\codex-rtl-patch.js',
+        'scripts\Watch-CodexRtl.ps1'
+    )
+    $missing = @()
+    foreach ($rel in $required) { if (-not (Test-Path (Join-Path $RepoRoot $rel))) { $missing += $rel } }
+    if ($missing.Count) { throw "[PACKAGE] Installer package is incomplete; missing: $($missing -join ', ')" }
+    return $true
+}
+
+function Assert-RtlDiskSpace {
+    # Worst-case preflight before building: we need room for a full staging copy
+    # (~source size) plus a safety buffer. The atomic swap renames within the same
+    # volume, so it needs no extra space. Logs the numbers; throws [DISK] if short.
+    param([Parameter(Mandatory)][string]$SourceDir)
+    $drive = Split-Path -Qualifier $script:Staging
+    $need = $null; $free = $null
+    try { $need = (Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } catch {}
+    try { $free = [double](Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction Stop).FreeSpace } catch {}
+    if (-not $need -or -not $free) { Write-RtlLog 'Disk check skipped (could not measure size/free space).'; return }
+    $required = ($need * 1.1) + 1GB
+    Write-RtlLog ("Disk check: drive={0} free={1:N1}GB source={2:N1}GB required={3:N1}GB" -f $drive, ($free / 1GB), ($need / 1GB), ($required / 1GB))
+    if ($free -lt $required) {
+        throw ("[DISK] Not enough free space on {0}: about {1:N1} GB needed, {2:N1} GB free. Free up space and try again." -f $drive, ($required / 1GB), ($free / 1GB))
+    }
+}
+
 function Invoke-Robocopy {
     param([string]$From, [string]$To)
     $a = @("`"$From`"", "`"$To`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
@@ -141,15 +299,28 @@ function Invoke-Robocopy {
 }
 
 function Invoke-AsarInject {
-    param([string]$AsarPath, [string]$PatchJs, [switch]$NoBak)
-    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
-    if (-not $node) { throw 'Node.js is required (it edits the app bundle) but was not found. Install it from https://nodejs.org and re-run.' }
+    param([string]$AsarPath, [string]$PatchJs, [switch]$NoBak, [switch]$AllowExternalNodeFallback)
+    # SAFETY: only ever edit an asar INSIDE our copy/staging, never the original app.
+    $full  = [System.IO.Path]::GetFullPath($AsarPath)
+    $copyP = [System.IO.Path]::GetFullPath($script:CopyRoot).TrimEnd('\') + '\'
+    $stagP = [System.IO.Path]::GetFullPath($script:Staging).TrimEnd('\') + '\'
+    if (-not ($full.StartsWith($copyP, [StringComparison]::OrdinalIgnoreCase) -or
+              $full.StartsWith($stagP, [StringComparison]::OrdinalIgnoreCase))) {
+        throw "[SAFETY] Refusing to edit an asar outside the RTL copy/staging: $full"
+    }
+    # End users depend ONLY on Codex's bundled Node; PATH fallback is dev/headless only.
+    $node = Resolve-RtlNode -AsarPath $AsarPath
+    if (-not $node -and $AllowExternalNodeFallback) {
+        $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+        if ($node) { Write-RtlLog "WARNING: bundled Node missing; using external PATH Node ($node) via -AllowExternalNodeFallback (non-standard)." }
+    }
+    if (-not $node) { throw "[NODE] Codex bundled Node (resources\cua_node\bin\node.exe) was not found next to the copied app; cannot edit the bundle." }
     $editor = Get-AsarEditPath
     if (-not $editor) { throw 'asar-edit.mjs not found.' }
     $bak = if ($NoBak) { '--no-bak' } else { '' }
     if ($bak) { $out = (& $node $editor $AsarPath $PatchJs $bak) | Out-String }
     else      { $out = (& $node $editor $AsarPath $PatchJs)      | Out-String }
-    if ($LASTEXITCODE -ne 0) { throw "asar-edit failed ($LASTEXITCODE): $($out.Trim())" }
+    if ($LASTEXITCODE -ne 0) { throw "[ASAR] asar-edit failed ($LASTEXITCODE): $($out.Trim())" }
     Write-RtlLog "asar-edit: $($out.Trim())"
 }
 
@@ -173,54 +344,170 @@ function Invoke-AtomicSwap {
 }
 
 function New-RtlShortcut {
-    $exe = Join-Path $script:CopyRoot 'app\Codex.exe'
+    # Differentiate from the regular Codex by NAME only ("Codex <ivrit>"), keeping
+    # Codex's ORIGINAL icon so the app stays visually recognizable as Codex. Creates
+    # both a Start-menu and a Desktop shortcut, and removes legacy-named shortcuts.
+    $exe  = Join-Path $script:CopyRoot 'app\Codex.exe'
+    $work = Join-Path $script:CopyRoot 'app'
     $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($script:ShortcutPath)
-    $sc.TargetPath = $exe; $sc.WorkingDirectory = (Join-Path $script:CopyRoot 'app'); $sc.IconLocation = "$exe,0"
-    $sc.Save()
+    foreach ($lnk in @($script:ShortcutStart, $script:ShortcutDesktop)) {
+        try {
+            $sc = $ws.CreateShortcut($lnk)
+            $sc.TargetPath       = $exe
+            $sc.WorkingDirectory = $work
+            $sc.IconLocation     = "$exe,0"   # original Codex icon
+            $sc.Description       = 'Codex with Hebrew / RTL support'
+            $sc.Save()
+        } catch {
+            $m = $_.Exception.Message
+            if ($lnk -eq $script:ShortcutDesktop -and ($m -match 'denied|access')) {
+                Write-RtlLog "Desktop shortcut blocked (likely Controlled Folder Access); the Start-menu shortcut still works. $m"
+            } else {
+                Write-RtlLog "shortcut '$lnk' failed: $m"
+            }
+        }
+    }
+    foreach ($old in $script:LegacyShortcuts) {
+        if (Test-Path $old) { try { Remove-Item -LiteralPath $old -Force } catch {} }
+    }
+}
+
+# Read-only environment report for support / diagnostics. Never modifies anything.
+function Invoke-CodexRtlDiagnose {
+    Start-RtlInstallLog 'diagnose' | Out-Null
+    Write-RtlLog '=== Diagnose start ==='
+    $r = [ordered]@{
+        CodexFound = $false; SourceType = $null; SourceVersion = $null; AppDir = $null
+        AsarPath = $null; AsarExists = $false; NodePath = $null; NodeExists = $false
+        LayoutValid = $false; LayoutError = $null
+        TargetDrive = $null; FreeGB = $null; SourceSizeGB = $null; EnoughSpace = $null
+        RtlInstalled = $false; CopyExists = $false; RtlRunning = $false; OriginalRunning = $false
+        StateOk = $false; PatchVersion = $script:PatchVersion
+    }
+    try {
+        $src = Resolve-CodexSource
+        if ($src) {
+            $r.CodexFound = $true; $r.SourceType = $src.Type; $r.SourceVersion = $src.Version
+            $r.AppDir = $src.AppDir; $r.AsarPath = $src.AsarPath; $r.AsarExists = (Test-Path $src.AsarPath)
+            $node = Resolve-RtlNode -AsarPath $src.AsarPath
+            $r.NodePath = $node; $r.NodeExists = [bool]$node
+            try { Test-CodexSource -Source $src | Out-Null; $r.LayoutValid = $true }
+            catch { $r.LayoutError = $_.Exception.Message }
+        }
+        $r.TargetDrive = (Split-Path -Qualifier $script:CopyRoot)
+        $freeBytes = $null
+        try {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($r.TargetDrive)'" -ErrorAction Stop
+            $freeBytes = [double]$disk.FreeSpace
+            $r.FreeGB = [math]::Round($freeBytes / 1GB, 1)
+        } catch {}
+        if ($src -and (Test-Path $src.AppDir)) {
+            try {
+                $sum = (Get-ChildItem -LiteralPath $src.AppDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                if ($sum) {
+                    $r.SourceSizeGB = [math]::Round($sum / 1GB, 2)
+                    if ($null -ne $freeBytes) { $r.EnoughSpace = ($freeBytes -gt ($sum * 1.1 + 1GB)) }
+                }
+            } catch {}
+        }
+        $state = Read-RtlState
+        $r.StateOk = [bool]$state
+        $r.CopyExists = (Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe'))
+        $r.RtlInstalled = ([bool]$state -and $r.CopyExists)
+        $r.RtlRunning = Test-CodexRtlRunning
+        $r.OriginalRunning = Test-OriginalCodexRunning
+    } catch { Write-RtlLog "diagnose error: $($_.Exception.Message)" }
+    foreach ($k in $r.Keys) { Write-RtlLog ("  {0} = {1}" -f $k, $r[$k]) }
+    Write-RtlLog '=== Diagnose end ==='
+    return [pscustomobject]$r
+}
+
+# Read-only status for the GUI to frame the right action. States:
+#   Fresh             no install, ready to install
+#   Update            Codex itself updated; the RTL copy is behind
+#   PatchUpgrade      our tool version changed; re-apply the patch
+#   UpToDate          installed and current
+#   Repair            a copy exists but its state record is missing/invalid
+#   ReinstallRequired state written by a newer tool version
+function Get-CodexRtlStatus {
+    $src = $null; try { $src = Resolve-CodexSource } catch {}
+    $copyOk = Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe')
+    $state = Read-RtlState
+    # corrupt state file (exists but did not parse) -> back it up once.
+    if (-not $state -and (Test-Path $script:StateFile)) {
+        try {
+            $raw = Get-Content $script:StateFile -Raw -ErrorAction Stop
+            if ($raw -and $raw.Trim()) {
+                Move-Item -LiteralPath $script:StateFile -Destination "$($script:StateFile).bad" -Force
+                Write-RtlLog 'Corrupt state.json backed up to state.json.bad.'
+            }
+        } catch {}
+    }
+    $o = [ordered]@{
+        State            = 'Fresh'
+        CodexFound       = [bool]$src
+        AvailableVersion = $(if ($src) { $src.Version } else { $null })
+        InstalledVersion = $(if ($state) { $state.codexVersion } else { $null })
+        CopyExists       = $copyOk
+        Running          = (Test-CodexRtlRunning)
+    }
+    if ($state -and $state.schemaVersion -and ([int]$state.schemaVersion -gt $script:SchemaVersion)) { $o.State = 'ReinstallRequired' }
+    elseif (-not $state) { $o.State = $(if ($copyOk) { 'Repair' } else { 'Fresh' }) }
+    elseif (-not $copyOk) { $o.State = 'Repair' }
+    elseif ($src -and $state.sourceSignature -ne $src.Signature) { $o.State = 'Update' }
+    elseif ($state.patchVersion -ne $script:PatchVersion) { $o.State = 'PatchUpgrade' }
+    else { $o.State = 'UpToDate' }
+    return [pscustomobject]$o
 }
 
 # ----------------------------------------------------------------- core update
 
 function Invoke-CodexRtlUpdate {
-    param([switch]$Force, [switch]$Auto)
+    param([switch]$Force, [switch]$Auto, [switch]$AllowExternalNodeFallback)
     if (-not (Enter-RtlLock)) { Write-RtlLog 'Another update is in progress; skipping.'; return }
     try {
+        Set-RtlStep 'preflight' 5
+        # self-heal: recover from a crash mid-swap (CopyRoot gone, OldRoot present).
+        if (-not (Test-Path $script:CopyRoot) -and (Test-Path $script:OldRoot)) {
+            Write-RtlLog 'Self-heal: CopyRoot missing but OldRoot present; restoring previous copy.'
+            try { Rename-Item -LiteralPath $script:OldRoot -NewName (Split-Path $script:CopyRoot -Leaf) -Force }
+            catch { Write-RtlLog "self-heal failed: $($_.Exception.Message)" }
+        }
         $src = Resolve-CodexSource
-        if (-not $src) { Write-RtlLog 'No Codex install found.'; if (-not $Auto) { throw 'Codex not found (install it from the Microsoft Store).' }; return }
-        $state = Read-RtlState
+        if (-not $src) {
+            Write-RtlLog '[NOCODEX] No Codex install found.'
+            if (-not $Auto) { throw '[NOCODEX] Codex not found (install it from the Microsoft Store).' }
+            return
+        }
+        Test-CodexSource -Source $src | Out-Null   # throws [LAYOUT]/[NODE] on structural problems
+
+        $state   = Read-RtlState
         $patchJs = Get-PatchJsPath
         if (-not $patchJs) { throw 'codex-rtl-patch.js not found.' }
 
         $current = if ($state) { $state.sourceSignature } else { $null }
-        if (-not $Force -and $current -eq $src.Signature -and (
-                ($src.Type -eq 'Store'  -and (Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe'))) -or
-                ($src.Type -eq 'Direct'))) {
+        if (-not $Force -and $current -eq $src.Signature -and (Test-Path (Join-Path $script:CopyRoot 'app\Codex.exe'))) {
             Write-RtlLog "Up to date (Codex v$($src.Version))."
+            Set-RtlStep 'done' 100
             return
         }
         Write-RtlLog "Update needed: Codex v$($src.Version) [$($src.Type)] (was '$current')"
 
-        if ($src.Type -eq 'Direct' -and $src.Writable) {
-            Write-RtlLog 'Patching direct (non-Store) install in place...'
-            Invoke-AsarInject -AsarPath $src.AsarPath -PatchJs $patchJs
-            Write-RtlState @{ patchVersion = $script:PatchVersion; mode = 'inplace'; sourceSignature = $src.Signature; version = $src.Version; asarPath = $src.AsarPath; updatedAt = (Get-Date).ToString('o') }
-            if ($Auto) { Show-RtlToast 'Codex RTL' "Patched Codex v$($src.Version)." }
-            return
-        }
-
-        # ---- Store / copy mode: build to staging, then atomic-swap when closed ----
+        # ---- copy mode (always): build to staging, then atomic-swap when closed ----
         $stagingSig = Join-Path $script:Staging '.codexrtl-sig'
         $stagingReady = (Test-Path (Join-Path $script:Staging 'app\Codex.exe')) -and
                         (Test-Path $stagingSig) -and ((Get-Content $stagingSig -Raw).Trim() -eq $src.Signature)
         if (-not $stagingReady) {
+            Assert-RtlDiskSpace -SourceDir $src.AppDir
+            Set-RtlStep 'copy' 15 $true
             Write-RtlLog 'Building patched copy in staging...'
             if (Test-Path $script:Staging) { Remove-Item -LiteralPath $script:Staging -Recurse -Force }
             $stagingApp = Join-Path $script:Staging 'app'
             New-Item -ItemType Directory -Force -Path $stagingApp | Out-Null
             $rc = Invoke-Robocopy -From $src.AppDir -To $stagingApp
-            if ($rc -ge 16) { throw "robocopy failed (exit $rc)" }
-            Invoke-AsarInject -AsarPath (Join-Path $stagingApp 'resources\app.asar') -PatchJs $patchJs
+            if ($rc -ge 8) { throw "[LOCK] Could not copy all files (robocopy exit $rc); they may be locked by antivirus or another process. Close them and try again." }
+            Set-RtlStep 'inject' 70 $true
+            Invoke-AsarInject -AsarPath (Join-Path $stagingApp 'resources\app.asar') -PatchJs $patchJs -AllowExternalNodeFallback:$AllowExternalNodeFallback
             Set-Content -LiteralPath $stagingSig -Value $src.Signature -Encoding UTF8 -NoNewline
             Write-RtlLog 'Staging build complete.'
         } else {
@@ -230,16 +517,23 @@ function Invoke-CodexRtlUpdate {
         if (Test-CodexRtlRunning) {
             Write-RtlLog 'Codex (RTL) is running; deferring swap (staging kept for next close).'
             if ($Auto) { Show-RtlToast 'Codex update ready' 'A newer Codex is staged. It will apply next time you close Codex.' }
+            Set-RtlStep 'deferred' 100
             return
         }
 
+        Set-RtlStep 'swap' 90
         Write-RtlLog 'Swapping staging into place (atomic)...'
         Invoke-AtomicSwap
+        Set-RtlStep 'shortcut' 95
         New-RtlShortcut
-        Write-RtlState @{ patchVersion = $script:PatchVersion; mode = 'copy'; sourceSignature = $src.Signature; version = $src.Version; target = $script:CopyRoot; updatedAt = (Get-Date).ToString('o') }
+        Write-RtlState @{ sourceSignature = $src.Signature; codexVersion = $src.Version; sourcePath = $src.AppDir }
         Write-RtlLog "DONE: Codex (RTL) now at v$($src.Version)."
+        Set-RtlStep 'done' 100
         if ($Auto) { Show-RtlToast 'Codex RTL updated' "Patched for Codex v$($src.Version)." }
-    } finally {
+    }
+    catch [System.UnauthorizedAccessException] { throw "[AV] Access was denied, possibly blocked by antivirus or Controlled Folder Access. $($_.Exception.Message)" }
+    catch [System.Security.SecurityException]   { throw "[AV] A security restriction blocked the operation, possibly antivirus. $($_.Exception.Message)" }
+    finally {
         Exit-RtlLock
     }
 }
@@ -261,7 +555,20 @@ function Register-CodexRtlWatcher {
     Write-RtlLog "Registered logon watcher (HKCU\Run)."
 }
 
+function Stop-CodexRtlWatcher {
+    # Kill any running watcher process(es) so a freshly deployed watcher (e.g. one
+    # that now hides its console) can replace it, and so uninstall leaves none behind.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*Watch-CodexRtl*' } |
+            ForEach-Object {
+                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-RtlLog "Stopped watcher PID $($_.ProcessId)." } catch {}
+            }
+    } catch {}
+}
+
 function Unregister-CodexRtlWatcher {
+    Stop-CodexRtlWatcher
     try { Remove-ItemProperty -Path $script:RunKey -Name $script:RunName -ErrorAction Stop; Write-RtlLog 'Removed logon watcher.' }
     catch { Write-RtlLog 'No logon watcher to remove.' }
     # also remove any legacy scheduled task from earlier versions
@@ -270,6 +577,7 @@ function Unregister-CodexRtlWatcher {
 
 function Start-CodexRtlWatcher {
     param([string]$WatchScript)
+    Stop-CodexRtlWatcher   # replace any existing (possibly visible) watcher with the fresh one
     $ps = (Get-Command powershell.exe).Source
     Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList @(
         '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $WatchScript, '-Loop')
@@ -280,7 +588,7 @@ function Start-CodexRtlWatcher {
 
 function Copy-RtlBin {
     # Copy the watcher's runtime files to a stable per-user location so the
-    # scheduled task never depends on the repo path.
+    # watcher never depends on the repo path.
     param([string]$RepoRoot)
     New-Item -ItemType Directory -Force -Path $script:BinDir | Out-Null
     Copy-Item (Join-Path $RepoRoot 'scripts\lib\codex-rtl-lib.ps1') (Join-Path $script:BinDir 'codex-rtl-lib.ps1') -Force
@@ -289,4 +597,29 @@ function Copy-RtlBin {
     Copy-Item (Join-Path $RepoRoot 'scripts\Watch-CodexRtl.ps1')    (Join-Path $script:BinDir 'Watch-CodexRtl.ps1') -Force
     Write-RtlLog "Deployed watcher runtime to $($script:BinDir)"
     return (Join-Path $script:BinDir 'Watch-CodexRtl.ps1')
+}
+
+# ----------------------------------------------------------------- uninstall
+
+function Invoke-CodexRtlUninstall {
+    # Remove the watcher, the patched copy (+ staging/old), all shortcuts and state.
+    # The logs folder is KEPT by default (for diagnostics); pass -PurgeLogs to delete it.
+    param([switch]$PurgeLogs)
+    if (Test-CodexRtlRunning) { throw '[LOCK] Codex (RTL) is running. Close it and try again.' }
+    if (-not (Enter-RtlLock)) { throw '[LOCK] An update is in progress; try again in a moment.' }
+    try {
+        Unregister-CodexRtlWatcher   # stops the watcher + removes the Run key + legacy task
+        foreach ($d in @($script:CopyRoot, $script:Staging, $script:OldRoot, $script:BinDir)) {
+            if (Test-Path $d) {
+                try { Remove-Item -LiteralPath $d -Recurse -Force; Write-RtlLog "removed $d" }
+                catch { Write-RtlLog "could not remove $d : $($_.Exception.Message)" }
+            }
+        }
+        foreach ($lnk in $script:ShortcutPaths) {
+            if (Test-Path $lnk) { try { Remove-Item -LiteralPath $lnk -Force; Write-RtlLog "removed $lnk" } catch {} }
+        }
+        if (Test-Path $script:StateFile) { Remove-Item -LiteralPath $script:StateFile -Force }
+        if ($PurgeLogs -and (Test-Path $script:LogsDir)) { try { Remove-Item -LiteralPath $script:LogsDir -Recurse -Force; Write-RtlLog 'Purged logs.' } catch {} }
+        Write-RtlLog 'Uninstall complete.'
+    } finally { Exit-RtlLock }
 }

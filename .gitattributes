@@ -3,6 +3,7 @@
 *.psm1 text eol=crlf
 *.bat  text eol=crlf
 *.cmd  text eol=crlf
+*.vbs  text eol=crlf
 *.js   text eol=lf
 *.mjs  text eol=lf
 *.md   text eol=lf
