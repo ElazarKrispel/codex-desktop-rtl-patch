@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================================
-rem  Codex RTL - friendly graphical installer (Hebrew / right-to-left support)
-rem  Double-click this file. No administrator rights are required.
-rem  It opens the installer window and hides this console.
+rem  Codex RTL - friendly graphical installer (Hebrew / right-to-left support).
+rem  Delegates to the VBS launcher so NO PowerShell/console window appears.
+rem  (Double-clicking Install-Codex-RTL.vbs directly is just as good.)
 rem ============================================================================
-start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "%~dp0scripts\Install-CodexRtlGui.ps1"
+start "" wscript.exe //nologo "%~dp0Install-Codex-RTL.vbs"

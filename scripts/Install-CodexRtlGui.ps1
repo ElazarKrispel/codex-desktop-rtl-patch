@@ -42,6 +42,17 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
+# Give the process a distinct AppUserModelID so its taskbar button uses the window's
+# own icon (Codex) and its own label, instead of grouping under (and showing the icon
+# of) PowerShell. Must be set before the window is created.
+try {
+    Add-Type -Namespace CodexRtl -Name TaskbarId -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int SetCurrentProcessExplicitAppUserModelID(string AppID);
+'@ -ErrorAction Stop
+    [void][CodexRtl.TaskbarId]::SetCurrentProcessExplicitAppUserModelID('CodexRtl.Installer')
+} catch {}
+
 # --- Package integrity (the lib must exist before we can use Test-RtlPackage) -
 if (-not (Test-Path $script:LibPath)) {
     [System.Windows.Forms.MessageBox]::Show(
